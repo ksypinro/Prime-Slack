@@ -1,21 +1,26 @@
 """
-Slack API Client — Dual-Mode HTTP Request Dispatcher.
+API Client Module — Protocol Abstraction & Factory Pattern for Slack API.
 
-This module demonstrates and implements two distinct methods of communicating
-with the Slack Web API:
+This module establishes a decoupled architecture for executing Slack API requests
+using Python's Protocol (PEP 544 structural subtyping) and the Factory Pattern:
 
-1. **Direct Slack Web API (In-Process HTTP via `slack_sdk.WebClient`)**:
-   - Sends outbound HTTPS requests directly from the Python runtime to
-     `https://slack.com/api/{method}` using an in-memory HTTP client.
-   - Ideal for low-latency production applications, bots, and high-throughput event handlers.
+1. **Protocol (`APIClient`)**:
+   Defines the contract that any Slack API client must satisfy:
+   - `call(method, **kwargs)`: Generic dynamic method invocation.
+   - `post_message(channel, text, thread_ts, **kwargs)`: Post message to a channel/thread.
+   - `add_reaction(channel, timestamp, name, **kwargs)`: Add emoji reaction.
+   - `get_conversation_replies(channel, ts, limit, **kwargs)`: Retrieve thread replies.
+   - `auth_test(**kwargs)`: Test bot authentication and identity.
 
-2. **Slack CLI Subprocess (`slack api <method>`)**:
-   - Executes the official Slack CLI binary as an external subprocess, passing
-     arguments and parsing the resulting stdout JSON.
-   - Ideal for shell scripts, DevOps pipelines, CI/CD runners, and ad-hoc terminal diagnostics.
+2. **Implementations**:
+   - `SlackWebClient`: In-process HTTPS requests via official `slack_sdk.WebClient`
+     using persistent HTTP keep-alive connection pooling.
+   - `SlackCliClient`: Out-of-process subprocess execution via the official `slack api`
+     CLI binary (`~/.slack/bin/slack`).
 
-Both clients implement a unified interface, allowing you to seamlessly swap or
-benchmark between in-process HTTP and CLI-based API execution.
+3. **Factory / Provider (`APIClientProvider`)**:
+   Centralizes client instantiation. By default, it provides `SlackWebClient`.
+   Clients can be toggled dynamically via parameter or `SLACK_API_CLIENT_TYPE` env var.
 """
 
 from __future__ import annotations
@@ -26,7 +31,7 @@ import os
 import shutil
 import subprocess
 import time
-from typing import Any, Dict, Optional
+from typing import Any, Protocol, runtime_checkable
 from dotenv import load_dotenv
 
 # Load local environment variables (.env)
@@ -41,25 +46,120 @@ logger: logging.Logger = logging.getLogger("SlackApiClient")
 
 
 class SlackApiError(Exception):
-    """Raised when an API call returns an unsuccessful response (ok=False)."""
+    """Raised when an API call fails or returns an error response (`ok=False`)."""
 
     def __init__(self, error: str, raw_response: dict[str, Any] | None = None) -> None:
         super().__init__(f"Slack API error: {error}")
         self.error: str = error
-        self.raw_response: dict[str, Any] | None = raw_response or {}
+        self.raw_response: dict[str, Any] = raw_response or {}
 
 
-class DirectWebClient:
-    """Sends HTTP requests directly to the Slack Web API using the Python SDK.
+# ---------------------------------------------------------------------------
+# 1. Protocol Abstraction (PEP 544 Structural Subtyping)
+# ---------------------------------------------------------------------------
+
+@runtime_checkable
+class APIClient(Protocol):
+    """Protocol defining the interface for Slack API clients.
+
+    Any conforming implementation can be used interchangeably by the application
+    layer without coupling to specific transport mechanisms.
+    """
+
+    def call(self, method: str, **kwargs: Any) -> dict[str, Any]:
+        """Invoke any Slack Web API method dynamically.
+
+        Args:
+            method: The API method name (e.g. 'chat.postMessage', 'auth.test').
+            **kwargs: Parameters passed to the method as keyword arguments.
+
+        Returns:
+            dict: Parsed JSON response payload from Slack.
+
+        Raises:
+            SlackApiError: If the API returns ok=False or request fails.
+        """
+        ...
+
+    def post_message(
+        self,
+        channel: str,
+        text: str,
+        thread_ts: str | None = None,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        """Post a message to a channel or thread (`chat.postMessage`).
+
+        Args:
+            channel: Slack channel ID.
+            text: Message body text (supports mrkdwn).
+            thread_ts: Optional parent thread timestamp to nest the reply.
+            **kwargs: Extra parameters (e.g. blocks, attachments).
+
+        Returns:
+            dict: Slack response dictionary containing ts, channel, etc.
+        """
+        ...
+
+    def add_reaction(
+        self,
+        channel: str,
+        timestamp: str,
+        name: str,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        """Add an emoji reaction to a message (`reactions.add`).
+
+        Args:
+            channel: Slack channel ID containing the message.
+            timestamp: Message timestamp to react to.
+            name: Emoji name without colons (e.g. 'eyes', 'white_check_mark').
+            **kwargs: Extra parameters.
+
+        Returns:
+            dict: Slack response dictionary.
+        """
+        ...
+
+    def get_conversation_replies(
+        self,
+        channel: str,
+        ts: str,
+        limit: int = 50,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        """Retrieve replies in a conversation thread (`conversations.replies`).
+
+        Args:
+            channel: Slack channel ID.
+            ts: Parent thread timestamp.
+            limit: Maximum number of messages to retrieve (default 50).
+            **kwargs: Extra parameters.
+
+        Returns:
+            dict: Slack response dictionary containing messages list.
+        """
+        ...
+
+    def auth_test(self, **kwargs: Any) -> dict[str, Any]:
+        """Verify bot authentication and retrieve identity (`auth.test`).
+
+        Returns:
+            dict: Slack response dictionary containing user, bot_id, team, etc.
+        """
+        ...
+
+
+# ---------------------------------------------------------------------------
+# 2. Implementation 1: SlackWebClient (In-Process HTTPS)
+# ---------------------------------------------------------------------------
+
+class SlackWebClient:
+    """Sends HTTP requests directly to the Slack Web API using `slack_sdk.WebClient`.
 
     This client maintains an in-process HTTP session and executes direct HTTPS
-    POST/GET requests to `https://slack.com/api/{method}` with:
-        - `Authorization: Bearer <xoxb-...>`
-        - `Content-Type: application/json; charset=utf-8`
-
-    Attributes:
-        token (str): The Slack Bot or User OAuth token.
-        client (WebClient): The underlying slack_sdk WebClient instance.
+    POST/GET requests to `https://slack.com/api/{method}` with persistent HTTP
+    keep-alive connection pooling.
     """
 
     def __init__(self, token: str | None = None) -> None:
@@ -73,28 +173,15 @@ class DirectWebClient:
         if not self.token:
             raise ValueError("SLACK_BOT_TOKEN must be provided or set in environment.")
 
-        # Import lazily to avoid overhead if only CLI is desired
         from slack_sdk import WebClient
-        self.client: WebClient = WebClient(token=self.token)
+        self._client: WebClient = WebClient(token=self.token)
 
     def call(self, method: str, **kwargs: Any) -> dict[str, Any]:
-        """Invoke any Slack Web API method directly via HTTP.
-
-        Args:
-            method: The Slack API method name (e.g., 'auth.test', 'chat.postMessage').
-            **kwargs: Parameters passed to the method as keyword arguments.
-
-        Returns:
-            dict: The parsed JSON dictionary response from Slack.
-
-        Raises:
-            SlackApiError: If Slack returns `{"ok": false, "error": ...}`.
-        """
+        """Invoke an arbitrary Slack Web API method directly via HTTP."""
         from slack_sdk.errors import SlackApiError as SdkApiError
 
         try:
-            # api_call allows arbitrary method invocations dynamically
-            response = self.client.api_call(api_method=method, json=kwargs if kwargs else None)
+            response = self._client.api_call(api_method=method, json=kwargs if kwargs else None)
             data: dict[str, Any] = response.data  # type: ignore[assignment]
             if not data.get("ok"):
                 raise SlackApiError(error=data.get("error", "unknown_error"), raw_response=data)
@@ -103,39 +190,68 @@ class DirectWebClient:
             error_code = err.response.get("error", str(err))
             raise SlackApiError(error=error_code, raw_response=err.response.data) from err
 
+    def post_message(
+        self,
+        channel: str,
+        text: str,
+        thread_ts: str | None = None,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        """Post a message via `chat.postMessage`."""
+        params: dict[str, Any] = {"channel": channel, "text": text, **kwargs}
+        if thread_ts:
+            params["thread_ts"] = thread_ts
+        return self.call("chat.postMessage", **params)
 
-class CliApiClient:
-    """Sends requests to the Slack API by invoking the `slack api` CLI command.
+    def add_reaction(
+        self,
+        channel: str,
+        timestamp: str,
+        name: str,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        """Add an emoji reaction via `reactions.add`."""
+        return self.call("reactions.add", channel=channel, timestamp=timestamp, name=name, **kwargs)
 
-    This client locates the Slack CLI binary (`slack`) on the host system and executes:
+    def get_conversation_replies(
+        self,
+        channel: str,
+        ts: str,
+        limit: int = 50,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        """Fetch conversation thread messages via `conversations.replies`."""
+        return self.call("conversations.replies", channel=channel, ts=ts, limit=limit, **kwargs)
+
+    def auth_test(self, **kwargs: Any) -> dict[str, Any]:
+        """Check authentication status via `auth.test`."""
+        return self.call("auth.test", **kwargs)
+
+
+# ---------------------------------------------------------------------------
+# 3. Implementation 2: SlackCliClient (Subprocess via `slack api`)
+# ---------------------------------------------------------------------------
+
+class SlackCliClient:
+    """Sends requests to the Slack API by executing the `slack api` CLI command.
+
+    This client locates the Slack CLI binary on the host system and executes:
         `slack api <method> --json '<payload>' --token <token>`
-
-    Attributes:
-        token (str): The Slack Bot or User OAuth token.
-        cli_path (str): The resolved absolute path to the `slack` executable.
     """
 
     def __init__(self, token: str | None = None, cli_path: str | None = None) -> None:
-        """Initialize the CLI-based API client.
+        """Initialize the CLI API client.
 
         Args:
-            token: Slack Bot or User token. Defaults to `SLACK_BOT_TOKEN`.
-            cli_path: Explicit path to the `slack` executable. If omitted,
-                      automatically discovers it via system PATH or `~/.slack/bin/slack`.
+            token: Slack Bot token. Defaults to `SLACK_BOT_TOKEN`.
+            cli_path: Optional explicit path to the `slack` binary.
         """
         self.token: str = token or os.environ.get("SLACK_BOT_TOKEN", "")
         self.cli_path: str = cli_path or self._resolve_cli_path()
 
     @staticmethod
     def _resolve_cli_path() -> str:
-        """Locate the Slack CLI binary across known install locations.
-
-        Returns:
-            str: Absolute path to the `slack` executable.
-
-        Raises:
-            FileNotFoundError: If the Slack CLI binary cannot be found.
-        """
+        """Locate the Slack CLI binary across known install locations."""
         # 1. Check system PATH
         path_from_shutil = shutil.which("slack")
         if path_from_shutil:
@@ -158,36 +274,22 @@ class CliApiClient:
         )
 
     def call(self, method: str, **kwargs: Any) -> dict[str, Any]:
-        """Invoke any Slack Web API method via the `slack api` CLI command.
-
-        Args:
-            method: The Slack API method name (e.g., 'auth.test', 'chat.postMessage').
-            **kwargs: Parameters passed to the method. Serialized as JSON.
-
-        Returns:
-            dict: The parsed JSON response emitted on stdout by the Slack CLI.
-
-        Raises:
-            SlackApiError: If the CLI returns a non-zero exit code or Slack reports ok=False.
-        """
+        """Invoke an arbitrary Slack Web API method via the `slack api` CLI command."""
         cmd: list[str] = [self.cli_path, "api", method]
 
-        # Pass token if available
         if self.token:
             cmd.extend(["--token", self.token])
 
-        # Pass arguments as a JSON payload flag
         if kwargs:
             cmd.extend(["--json", json.dumps(kwargs)])
 
         logger.debug("Executing CLI command: %s", " ".join(cmd))
 
-        # Run external process synchronously and capture output
         proc = subprocess.run(
             cmd,
             capture_output=True,
             text=True,
-            check=False
+            check=False,
         )
 
         stdout_clean = proc.stdout.strip()
@@ -202,7 +304,7 @@ class CliApiClient:
         except json.JSONDecodeError as json_err:
             raise SlackApiError(
                 error=f"Failed to parse JSON from CLI stdout: {stdout_clean}",
-                raw_response={"stdout": stdout_clean, "stderr": stderr_clean}
+                raw_response={"stdout": stdout_clean, "stderr": stderr_clean},
             ) from json_err
 
         if not data.get("ok"):
@@ -210,45 +312,137 @@ class CliApiClient:
 
         return data
 
+    def post_message(
+        self,
+        channel: str,
+        text: str,
+        thread_ts: str | None = None,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        """Post a message via `chat.postMessage`."""
+        params: dict[str, Any] = {"channel": channel, "text": text, **kwargs}
+        if thread_ts:
+            params["thread_ts"] = thread_ts
+        return self.call("chat.postMessage", **params)
+
+    def add_reaction(
+        self,
+        channel: str,
+        timestamp: str,
+        name: str,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        """Add an emoji reaction via `reactions.add`."""
+        return self.call("reactions.add", channel=channel, timestamp=timestamp, name=name, **kwargs)
+
+    def get_conversation_replies(
+        self,
+        channel: str,
+        ts: str,
+        limit: int = 50,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        """Fetch conversation thread messages via `conversations.replies`."""
+        return self.call("conversations.replies", channel=channel, ts=ts, limit=limit, **kwargs)
+
+    def auth_test(self, **kwargs: Any) -> dict[str, Any]:
+        """Check authentication status via `auth.test`."""
+        return self.call("auth.test", **kwargs)
+
+
+# ---------------------------------------------------------------------------
+# 4. Factory Pattern: APIClientProvider
+# ---------------------------------------------------------------------------
+
+class APIClientProvider:
+    """Factory provider that resolves and instantiates an `APIClient`.
+
+    By default, it provides `SlackWebClient` for high-performance in-process HTTP.
+    Alternatively, setting `client_type="cli"` or the `SLACK_API_CLIENT_TYPE=cli`
+    environment variable provides `SlackCliClient`.
+    """
+
+    @classmethod
+    def get_client(
+        cls,
+        client_type: str | None = None,
+        token: str | None = None,
+        **kwargs: Any,
+    ) -> APIClient:
+        """Provide an instance conforming to the `APIClient` protocol.
+
+        Args:
+            client_type: "web" (default) or "cli". If omitted, inspects the
+                `SLACK_API_CLIENT_TYPE` environment variable (default: "web").
+            token: Optional Slack token override.
+            **kwargs: Extra parameters passed to the client constructor.
+
+        Returns:
+            APIClient: An instantiated client satisfying the `APIClient` protocol.
+
+        Raises:
+            ValueError: If an unrecognized `client_type` is specified.
+        """
+        # Determine client type (explicit arg > environment variable > default 'web')
+        resolved_type = (
+            client_type
+            or os.environ.get("SLACK_API_CLIENT_TYPE", "web")
+        ).lower().strip()
+
+        logger.info("Resolving API client of type: '%s'", resolved_type)
+
+        if resolved_type in ("web", "slackwebclient", "direct"):
+            client = SlackWebClient(token=token, **kwargs)
+        elif resolved_type in ("cli", "slackcliclient", "slack_cli"):
+            client = SlackCliClient(token=token, **kwargs)
+        else:
+            raise ValueError(
+                f"Unknown client_type '{resolved_type}'. Expected 'web' or 'cli'."
+            )
+
+        # Static / runtime contract verification
+        assert isinstance(client, APIClient), f"{client.__class__.__name__} must satisfy APIClient Protocol"
+        return client
+
+
+# ---------------------------------------------------------------------------
+# 5. Diagnostic & Benchmark Utility
+# ---------------------------------------------------------------------------
 
 def compare_clients(method: str = "auth.test", **kwargs: Any) -> None:
-    """Benchmark and compare Direct Web API vs Slack CLI for a given method call.
-
-    Args:
-        method: The Slack API method to test (e.g. 'auth.test').
-        **kwargs: Arguments to pass to the method.
-    """
+    """Benchmark and compare Direct Web API vs Slack CLI for a given method call."""
     print("\n" + "=" * 70)
-    print(f"SLACK API COMPARISON BENCHMARK: method='{method}'")
+    print(f"SLACK API PROTOCOL BENCHMARK: method='{method}'")
     print("=" * 70)
 
-    # 1. Direct Web API Test
-    print("\n[Method 1: Direct Slack Web API (Python SDK / In-Process HTTPS)]")
+    # 1. WebClient via Provider
+    print("\n[Method 1: SlackWebClient via APIClientProvider]")
     try:
-        web_client = DirectWebClient()
-        start_time = time.perf_counter()
+        web_client: APIClient = APIClientProvider.get_client("web")
+        t0 = time.perf_counter()
         web_res = web_client.call(method, **kwargs)
-        web_latency = (time.perf_counter() - start_time) * 1000.0
+        web_latency = (time.perf_counter() - t0) * 1000.0
 
+        print(f"  Protocol : APIClient verified (isinstance: {isinstance(web_client, APIClient)})")
         print(f"  Status   : SUCCESS (ok=True)")
         print(f"  Latency  : {web_latency:.1f} ms")
-        print(f"  Response : {json.dumps(web_res, indent=2)}")
+        print(f"  User     : {web_res.get('user')}")
     except Exception as err:
         print(f"  Failed   : {err}")
         web_latency = None
 
-    # 2. Slack CLI Subprocess Test
-    print("\n[Method 2: Slack CLI Subprocess (`slack api` command)]")
+    # 2. CliClient via Provider
+    print("\n[Method 2: SlackCliClient via APIClientProvider]")
     try:
-        cli_client = CliApiClient()
-        print(f"  Binary   : {cli_client.cli_path}")
-        start_time = time.perf_counter()
+        cli_client: APIClient = APIClientProvider.get_client("cli")
+        t0 = time.perf_counter()
         cli_res = cli_client.call(method, **kwargs)
-        cli_latency = (time.perf_counter() - start_time) * 1000.0
+        cli_latency = (time.perf_counter() - t0) * 1000.0
 
+        print(f"  Protocol : APIClient verified (isinstance: {isinstance(cli_client, APIClient)})")
         print(f"  Status   : SUCCESS (ok=True)")
         print(f"  Latency  : {cli_latency:.1f} ms")
-        print(f"  Response : {json.dumps(cli_res, indent=2)}")
+        print(f"  User     : {cli_res.get('user')}")
     except Exception as err:
         print(f"  Failed   : {err}")
         cli_latency = None
@@ -258,9 +452,9 @@ def compare_clients(method: str = "auth.test", **kwargs: Any) -> None:
     print("COMPARISON SUMMARY:")
     if web_latency is not None and cli_latency is not None:
         speedup = cli_latency / web_latency if web_latency > 0 else 0
-        print(f"  Direct Web API : {web_latency:7.1f} ms (Persistent HTTPS session, zero process overhead)")
-        print(f"  Slack CLI      : {cli_latency:7.1f} ms (External Go binary spawn + handshake per call)")
-        print(f"  Performance    : Direct Web API is ~{speedup:.1f}x faster for real-time operations.")
+        print(f"  SlackWebClient : {web_latency:7.1f} ms (In-process persistent HTTP)")
+        print(f"  SlackCliClient : {cli_latency:7.1f} ms (External CLI subprocess)")
+        print(f"  Speedup Ratio  : SlackWebClient is ~{speedup:.1f}x faster.")
     print("=" * 70 + "\n")
 
 

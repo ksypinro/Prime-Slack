@@ -608,54 +608,107 @@ When you run `slack api` from the terminal or via `CliApiClient.call()`:
 
 ---
 
-### Dual-Mode Implementation (`api_client.py`)
+### Protocol Abstraction & Factory Pattern (`api_client.py`)
 
-The included [`api_client.py`](api_client.py) module provides clean Python classes for both approaches:
+To ensure clean separation of concerns and maximum modularity, outbound Slack communication is built around **PEP 544 Protocol structural typing** and the **Factory Pattern**:
 
-```python
-from api_client import DirectWebClient, CliApiClient
-
-# 1. Direct Web API Client (In-process HTTPS)
-web_client = DirectWebClient()
-res_web = web_client.call("auth.test")
-print(res_web["user"])
-
-# 2. CLI-Based API Client (Subprocess execution)
-cli_client = CliApiClient()
-res_cli = cli_client.call("auth.test")
-print(res_cli["user"])
+```
+                       ┌─────────────────────────┐
+                       │     APIClientProvider   │
+                       │    (Factory Provider)   │
+                       └────────────┬────────────┘
+                                    │
+                         get_client() [default: 'web']
+                                    ▼
+                       ┌─────────────────────────┐
+                       │        APIClient        │
+                       │   (Protocol Contract)   │
+                       └────────────┬────────────┘
+                                    │
+                  ┌─────────────────┴─────────────────┐
+                  ▼                                   ▼
+        ┌───────────────────┐               ┌───────────────────┐
+        │   SlackWebClient  │               │   SlackCliClient  │
+        │(In-Process HTTPS) │               │(Subprocess `slack`)│
+        └───────────────────┘               └───────────────────┘
 ```
 
-#### Run the Live Benchmark
+#### 1. The `APIClient` Protocol
+Defines the contract expected across the application:
+- `call(method, **kwargs)`: Generic method invocation (e.g. `call("auth.test")`).
+- `post_message(channel, text, thread_ts, **kwargs)`: Posts a message to a channel/thread.
+- `add_reaction(channel, timestamp, name, **kwargs)`: Adds an emoji reaction.
+- `get_conversation_replies(channel, ts, limit, **kwargs)`: Retrieves thread conversation history.
+- `auth_test(**kwargs)`: Validates bot identity and workspace connectivity.
 
-Run the comparison benchmark directly from your terminal:
+#### 2. The Implementation Classes
+- **`SlackWebClient`**: Implements `APIClient` using `slack_sdk.WebClient` via persistent HTTPS connections.
+- **`SlackCliClient`**: Implements `APIClient` by executing the `slack api` CLI binary and parsing JSON output.
+
+#### 3. Factory Provider: `APIClientProvider`
+Provides an instance conforming to `APIClient`. By default, it yields `SlackWebClient`:
+
+```python
+from api_client import APIClient, APIClientProvider
+
+# Default: returns SlackWebClient (in-process persistent HTTPS)
+client: APIClient = APIClientProvider.get_client()
+
+# Explicit: returns SlackCliClient (external CLI binary subprocess)
+cli_client: APIClient = APIClientProvider.get_client("cli")
+```
+
+#### 4. Switching Implementations in `app.py`
+The main application ([`app.py`](app.py)) holds an `APIClient` protocol reference obtained from `APIClientProvider`:
+
+```python
+# app.py holds the APIClient protocol:
+api_client: APIClient = APIClientProvider.get_client()
+
+# Handlers use the protocol methods interchangeably:
+api_client.add_reaction(channel=channel_id, timestamp=message_ts, name="eyes")
+api_client.post_message(channel=channel_id, thread_ts=thread_ts, text=reply_content)
+```
+
+You can toggle the client type globally without changing any code by setting the environment variable in `.env`:
+```bash
+# In .env:
+SLACK_API_CLIENT_TYPE=web   # High-performance default (~370 ms)
+# or:
+SLACK_API_CLIENT_TYPE=cli   # Dispatches via `slack api` binary (~1650 ms)
+```
+
+#### 5. Run the Live Benchmark
+
+Run the live comparison benchmark directly from your terminal:
 
 ```bash
 python api_client.py
 ```
 
-Sample output:
+Sample benchmark output on your workspace:
 ```text
 ======================================================================
-SLACK API COMPARISON BENCHMARK: method='auth.test'
+SLACK API PROTOCOL BENCHMARK: method='auth.test'
 ======================================================================
 
-[Method 1: Direct Slack Web API (Python SDK / In-Process HTTPS)]
+[Method 1: SlackWebClient via APIClientProvider]
+  Protocol : APIClient verified (isinstance: True)
   Status   : SUCCESS (ok=True)
-  Latency  : 378.1 ms
-  Response : { "ok": true, "user": "this_is_my_assistant", ... }
+  Latency  : 371.6 ms
+  User     : this_is_my_assistant
 
-[Method 2: Slack CLI Subprocess (`slack api` command)]
-  Binary   : ~/.slack/bin/slack
+[Method 2: SlackCliClient via APIClientProvider]
+  Protocol : APIClient verified (isinstance: True)
   Status   : SUCCESS (ok=True)
-  Latency  : 1656.9 ms
-  Response : { "ok": true, "user": "this_is_my_assistant", ... }
+  Latency  : 1731.6 ms
+  User     : this_is_my_assistant
 
 ----------------------------------------------------------------------
 COMPARISON SUMMARY:
-  Direct Web API :   378.1 ms (Persistent HTTPS session, zero process overhead)
-  Slack CLI      :  1656.9 ms (External Go binary spawn + handshake per call)
-  Performance    : Direct Web API is ~4.4x faster for real-time operations.
+  SlackWebClient :   371.6 ms (In-process persistent HTTP)
+  SlackCliClient :  1731.6 ms (External CLI subprocess)
+  Speedup Ratio  : SlackWebClient is ~4.7x faster.
 ======================================================================
 ```
 

@@ -11,6 +11,18 @@ Architecture Overview:
     │    Slack Cloud     │ <────────────────────── │   This Process      │
     │  (Events Engine)   │ ──────────────────────> │   (SocketModeHandler)│
     └───────────────────┘    event JSON frames     └─────────────────────┘
+                                                              │
+                                                              ▼
+                                                   ┌─────────────────────┐
+                                                   │      APIClient      │
+                                                   │ (Protocol Abstrct.) │
+                                                   └─────────────────────┘
+                                                    ▲                   ▲
+                                         (default) │                   │ (optional)
+                                    ┌──────────────┴────┐       ┌──────┴────────────┐
+                                    │   SlackWebClient  │       │   SlackCliClient  │
+                                    │ (In-Process HTTPS)│       │(Subprocess `slack`)
+                                    └───────────────────┘       └───────────────────┘
 
 Supported Events:
     - ``app_mention``: Triggered when a user @mentions the bot in any channel
@@ -21,11 +33,11 @@ Supported Events:
 Lifecycle (per mention):
     1. Receive the ``app_mention`` event payload via WebSocket frame.
     2. Acknowledge the event within Slack's 3-second SLA (handled by Bolt).
-    3. Add a 👀 (:eyes:) emoji reaction for immediate visual feedback.
-    4. Fetch the full thread conversation history using ``conversations.replies``.
+    3. Add a 👀 (:eyes:) emoji reaction for immediate visual feedback via ``api_client.add_reaction``.
+    4. Fetch full thread history via ``api_client.get_conversation_replies``.
     5. Delegate context analysis to :mod:`processor` for AI/automation processing.
-    6. Post the generated response back inside the thread via ``chat.postMessage``.
-    7. Add a ✅ (:white_check_mark:) emoji reaction to signal completion.
+    6. Post the response back inside the thread via ``api_client.post_message``.
+    7. Add a ✅ (:white_check_mark:) emoji reaction to signal completion via ``api_client.add_reaction``.
 
 Dependencies:
     - ``slack-bolt``: Slack's official Python framework for event-driven apps.
@@ -37,8 +49,11 @@ Usage:
 
         $ python app.py
 
-    See ``test_connection.py`` for a pre-flight diagnostic check.
+    See ``test_connection.py`` for a pre-flight diagnostic check, and
+    ``api_client.py`` for benchmarking ``SlackWebClient`` vs ``SlackCliClient``.
 """
+
+from __future__ import annotations
 
 import os
 import sys
@@ -47,8 +62,8 @@ import logging
 from dotenv import load_dotenv
 from slack_bolt import App
 from slack_bolt.adapter.socket_mode import SocketModeHandler
-from slack_sdk.errors import SlackApiError
 
+from api_client import APIClient, APIClientProvider, SlackApiError
 import processor
 
 # ---------------------------------------------------------------------------
@@ -77,7 +92,7 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     handlers=[logging.StreamHandler(sys.stdout)],
 )
-logger = logging.getLogger("PrimeBot")
+logger: logging.Logger = logging.getLogger("PrimeBot")
 
 # ---------------------------------------------------------------------------
 # 3. Startup Validation — Fail fast on misconfiguration
@@ -97,15 +112,19 @@ if not SLACK_APP_TOKEN or not SLACK_APP_TOKEN.startswith("xapp-"):
     sys.exit(1)
 
 # ---------------------------------------------------------------------------
-# 4. Bolt App Initialization
+# 4. API Client & Bolt App Initialization (Protocol & Factory Pattern)
 # ---------------------------------------------------------------------------
-app = App(token=SLACK_BOT_TOKEN)
+# The application holds an instance conforming to the APIClient protocol,
+# created by APIClientProvider. By default, it yields SlackWebClient.
+# If SLACK_API_CLIENT_TYPE=cli is configured, it transparently yields SlackCliClient.
+api_client: APIClient = APIClientProvider.get_client()
+
+app: App = App(token=SLACK_BOT_TOKEN)
 
 
 # ---------------------------------------------------------------------------
 # 5. Event Handlers
 # ---------------------------------------------------------------------------
-
 
 @app.event("app_mention")
 def handle_app_mention(event: dict, client, logger) -> None:
@@ -113,36 +132,24 @@ def handle_app_mention(event: dict, client, logger) -> None:
 
     This handler orchestrates the full observation-and-response pipeline:
 
-    1. **Visual Acknowledgement** — Adds a 👀 emoji reaction to show the
-       bot is actively processing the request.
-    2. **Context Extraction** — Calls the Slack Web API method
-       ``conversations.replies`` to retrieve the complete thread history
-       (up to 50 messages). If the mention occurred as a top-level channel
-       message (not inside a thread), ``thread_ts`` falls back to the
-       message's own ``ts``, so the reply still creates a tidy thread.
+    1. **Visual Acknowledgement** — Adds a 👀 emoji reaction via ``api_client.add_reaction``.
+    2. **Context Extraction** — Calls ``api_client.get_conversation_replies``
+       to retrieve the complete thread history (up to 50 messages).
     3. **Processing** — Delegates the thread context to
        :func:`processor.process_thread_context`, which is the pluggable
        integration point for LLMs, shell scripts, or custom automation.
     4. **Response Posting** — Posts the processor's output back into the
-       same thread via ``chat.postMessage`` with the ``thread_ts`` parameter.
-    5. **Completion Signal** — Adds a ✅ emoji reaction to indicate the
-       pipeline has finished.
+       same thread via ``api_client.post_message`` with the ``thread_ts`` parameter.
+    5. **Completion Signal** — Adds a ✅ emoji reaction via ``api_client.add_reaction``
+       to indicate the pipeline has finished.
 
     Args:
         event: The ``app_mention`` event payload dictionary from Slack.
-            Key fields:
-            - ``channel`` (str): Channel ID where the mention occurred.
-            - ``ts`` (str): Timestamp of the mention message (unique ID).
-            - ``thread_ts`` (str | None): Parent thread timestamp, present
-              only if the mention was inside an existing reply thread.
-            - ``user`` (str): User ID of the person who mentioned the bot.
-            - ``text`` (str): Raw message text including ``<@BOT_ID>`` tag.
-        client: The Slack ``WebClient`` instance provided by Bolt, pre-
-            authenticated with ``SLACK_BOT_TOKEN``.
+        client: The Slack ``WebClient`` instance provided by Bolt.
         logger: Scoped logger instance provided by Bolt.
     """
-    channel_id: str = event.get("channel")
-    message_ts: str = event.get("ts")
+    channel_id: str = event.get("channel", "")
+    message_ts: str = event.get("ts", "")
 
     # Determine the thread root:
     #   - If 'thread_ts' exists → mention was inside an existing thread.
@@ -150,7 +157,7 @@ def handle_app_mention(event: dict, client, logger) -> None:
     #     Using message_ts as thread_ts causes the reply to create a new thread.
     thread_ts: str = event.get("thread_ts", message_ts)
 
-    user_id: str = event.get("user")
+    user_id: str = event.get("user", "")
     trigger_text: str = event.get("text", "")
 
     logger.info(
@@ -160,26 +167,26 @@ def handle_app_mention(event: dict, client, logger) -> None:
 
     # -- Step 1: Add "eyes" emoji reaction for visual feedback ---------------
     try:
-        client.reactions_add(
+        api_client.add_reaction(
             channel=channel_id,
-            name="eyes",
             timestamp=message_ts,
+            name="eyes",
         )
-    except SlackApiError as e:
+    except (SlackApiError, Exception) as e:
         # Non-fatal: the reaction is cosmetic, so we log and continue.
-        logger.warning("Could not add 'eyes' reaction: %s", e.response.get("error"))
+        logger.warning("Could not add 'eyes' reaction: %s", e)
 
     # -- Step 2: Fetch thread context via conversations.replies --------------
     try:
-        history_response = client.conversations_replies(
+        history_response = api_client.get_conversation_replies(
             channel=channel_id,
             ts=thread_ts,
             limit=50,  # Maximum messages to retrieve from the thread
         )
         thread_messages: list[dict] = history_response.get("messages", [])
         logger.info("Retrieved %d messages from thread context.", len(thread_messages))
-    except SlackApiError as e:
-        logger.error("Failed to retrieve thread history: %s", e.response.get("error"))
+    except (SlackApiError, Exception) as e:
+        logger.error("Failed to retrieve thread history: %s", e)
         # Graceful degradation: fall back to the single triggering message.
         thread_messages = [event]
 
@@ -196,23 +203,23 @@ def handle_app_mention(event: dict, client, logger) -> None:
 
     # -- Step 4: Post the response inside the thread -------------------------
     try:
-        client.chat_postMessage(
+        api_client.post_message(
             channel=channel_id,
             thread_ts=thread_ts,  # Keeps the reply nested inside the thread
             text=reply_content,
         )
         logger.info("Successfully posted response to thread %s.", thread_ts)
-    except SlackApiError as e:
-        logger.error("Failed to post message to Slack: %s", e.response.get("error"))
+    except (SlackApiError, Exception) as e:
+        logger.error("Failed to post message to Slack: %s", e)
 
     # -- Step 5: Add completion checkmark reaction ---------------------------
     try:
-        client.reactions_add(
+        api_client.add_reaction(
             channel=channel_id,
-            name="white_check_mark",
             timestamp=message_ts,
+            name="white_check_mark",
         )
-    except SlackApiError:
+    except Exception:
         # Non-fatal: silently ignore if the reaction can't be added.
         pass
 
@@ -226,21 +233,8 @@ def handle_direct_messages(event: dict, client, logger) -> None:
     (including the bot itself) are explicitly ignored to prevent infinite
     reply loops.
 
-    Unlike ``app_mention`` events, DM messages do not require the user to
-    @mention the bot — any text sent in the bot's DM window triggers this
-    handler.
-
     Args:
         event: The ``message`` event payload dictionary from Slack.
-            Key fields:
-            - ``channel_type`` (str): ``"im"`` for direct messages,
-              ``"channel"`` for public channels, ``"group"`` for private.
-            - ``channel`` (str): Channel/DM ID.
-            - ``ts`` (str): Timestamp of the message.
-            - ``user`` (str): User ID who sent the message.
-            - ``text`` (str): Raw message text.
-            - ``bot_id`` (str | None): Present if the message was sent by a
-              bot — used to filter out bot-generated messages.
         client: The Slack ``WebClient`` instance provided by Bolt.
         logger: Scoped logger instance provided by Bolt.
     """
@@ -248,9 +242,9 @@ def handle_direct_messages(event: dict, client, logger) -> None:
 
     # Only process 1:1 direct messages from real users (not bots).
     if channel_type == "im" and not event.get("bot_id"):
-        channel_id: str = event.get("channel")
-        message_ts: str = event.get("ts")
-        user_id: str = event.get("user")
+        channel_id: str = event.get("channel", "")
+        message_ts: str = event.get("ts", "")
+        user_id: str = event.get("user", "")
         text: str = event.get("text", "")
 
         logger.info("💬 Direct message received from User <%s>: %s", user_id, text)
@@ -262,10 +256,13 @@ def handle_direct_messages(event: dict, client, logger) -> None:
             triggering_text=text,
         )
 
-        client.chat_postMessage(
-            channel=channel_id,
-            text=reply_content,
-        )
+        try:
+            api_client.post_message(
+                channel=channel_id,
+                text=reply_content,
+            )
+        except (SlackApiError, Exception) as e:
+            logger.error("Failed to post DM response to Slack: %s", e)
 
 
 # ---------------------------------------------------------------------------
@@ -276,6 +273,7 @@ if __name__ == "__main__":
     logger.info("=" * 60)
     logger.info("🚀 Starting Prime Bot in Socket Mode...")
     logger.info("   Connection: Outbound WebSocket (wss://) on port 443")
+    logger.info("   Client:     %s (via APIClientProvider)", api_client.__class__.__name__)
     logger.info("   Tunnels:    None required (no ngrok / public webhooks)")
     logger.info("   Events:     app_mention, message.im")
     logger.info("   Processor:  processor.py")
