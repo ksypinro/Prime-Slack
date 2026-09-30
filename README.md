@@ -26,7 +26,7 @@ An enterprise-ready, firewall-friendly Python application that observes Slack wo
 - [Sending API Requests: Direct Web API vs. Slack CLI](#sending-api-requests-direct-web-api-vs-slack-cli)
   - [Under the Hood: HTTP Mechanics Comparison](#under-the-hood-http-mechanics-comparison)
   - [Comprehensive Comparison Matrix](#comprehensive-comparison-matrix)
-  - [Dual-Mode Implementation (`api_client.py`)](#dual-mode-implementation-api_clientpy)
+  - [Modular Architecture (`APIClient/` Package)](#modular-architecture-apiclient-package)
 - [Customizing the Analysis Logic (`processor.py`)](#customizing-the-analysis-logic-processorpy)
 - [Project Structure](#project-structure)
 
@@ -526,7 +526,7 @@ This project supports and demonstrates **two distinct ways** of sending API requ
 1. **Direct Slack Web API (In-Process HTTPS via Python SDK / REST)**
 2. **Slack CLI Subprocess (`slack api` command)**
 
-A dedicated dual-mode module, [`api_client.py`](api_client.py), implements both approaches and includes an automated benchmarking tool.
+A dedicated package, [`APIClient/`](APIClient/), implements both approaches with strict Single Responsibility Principle (one class/protocol per file) and includes an automated benchmarking tool.
 
 ---
 
@@ -608,13 +608,26 @@ When you run `slack api` from the terminal or via `CliApiClient.call()`:
 
 ---
 
-### Protocol Abstraction & Factory Pattern (`api_client.py`)
+### Modular Architecture (`APIClient/` Package)
 
-To ensure clean separation of concerns and maximum modularity, outbound Slack communication is built around **PEP 544 Protocol structural typing** and the **Factory Pattern**:
+To ensure strict separation of concerns, high maintainability, and clean design (Single Responsibility Principle), all Slack API communication is organized into the [`APIClient/`](APIClient/) package. **Each file contains exactly one class or protocol:**
+
+```
+APIClient/
+├── __init__.py      # Clean package entrypoint exporting public API
+├── protocol.py      # Protocol: APIClient (structural contract)
+├── web_client.py    # Class: SlackWebClient (in-process persistent HTTPS)
+├── cli_client.py    # Class: SlackCliClient (subprocess `slack api`)
+├── provider.py      # Class: APIClientProvider (factory provider)
+├── exceptions.py    # Class: SlackApiError (custom exception)
+└── benchmark.py     # Diagnostic & benchmark comparison runner
+```
+
+#### Protocol & Factory Pattern Flow
 
 ```
                        ┌─────────────────────────┐
-                       │     APIClientProvider   │
+                       │    APIClientProvider    │
                        │    (Factory Provider)   │
                        └────────────┬────────────┘
                                     │
@@ -633,8 +646,8 @@ To ensure clean separation of concerns and maximum modularity, outbound Slack co
         └───────────────────┘               └───────────────────┘
 ```
 
-#### 1. The `APIClient` Protocol
-Defines the contract expected across the application:
+#### 1. The `APIClient` Protocol ([`APIClient/protocol.py`](APIClient/protocol.py))
+Defines the strict structural contract expected across the application:
 - `call(method, **kwargs)`: Generic method invocation (e.g. `call("auth.test")`).
 - `post_message(channel, text, thread_ts, **kwargs)`: Posts a message to a channel/thread.
 - `add_reaction(channel, timestamp, name, **kwargs)`: Adds an emoji reaction.
@@ -642,14 +655,14 @@ Defines the contract expected across the application:
 - `auth_test(**kwargs)`: Validates bot identity and workspace connectivity.
 
 #### 2. The Implementation Classes
-- **`SlackWebClient`**: Implements `APIClient` using `slack_sdk.WebClient` via persistent HTTPS connections.
-- **`SlackCliClient`**: Implements `APIClient` by executing the `slack api` CLI binary and parsing JSON output.
+- **`SlackWebClient`** ([`APIClient/web_client.py`](APIClient/web_client.py)): Implements `APIClient` using `slack_sdk.WebClient` via persistent HTTPS connections with connection pooling.
+- **`SlackCliClient`** ([`APIClient/cli_client.py`](APIClient/cli_client.py)): Implements `APIClient` by executing the `slack api` CLI binary and parsing JSON output.
 
-#### 3. Factory Provider: `APIClientProvider`
+#### 3. Factory Provider: `APIClientProvider` ([`APIClient/provider.py`](APIClient/provider.py))
 Provides an instance conforming to `APIClient`. By default, it yields `SlackWebClient`:
 
 ```python
-from api_client import APIClient, APIClientProvider
+from APIClient import APIClient, APIClientProvider
 
 # Default: returns SlackWebClient (in-process persistent HTTPS)
 client: APIClient = APIClientProvider.get_client()
@@ -662,6 +675,8 @@ cli_client: APIClient = APIClientProvider.get_client("cli")
 The main application ([`app.py`](app.py)) holds an `APIClient` protocol reference obtained from `APIClientProvider`:
 
 ```python
+from APIClient import APIClient, APIClientProvider
+
 # app.py holds the APIClient protocol:
 api_client: APIClient = APIClientProvider.get_client()
 
@@ -683,7 +698,7 @@ SLACK_API_CLIENT_TYPE=cli   # Dispatches via `slack api` binary (~1650 ms)
 Run the live comparison benchmark directly from your terminal:
 
 ```bash
-python api_client.py
+python -m APIClient.benchmark
 ```
 
 Sample benchmark output on your workspace:
@@ -745,8 +760,15 @@ def process_thread_context(thread_messages, triggering_user, triggering_text):
 .
 ├── app.py                 # Core Bolt app — Socket Mode event listener & dispatcher
 ├── processor.py           # Pluggable thread context analyzer (LLM / automation hook)
-├── api_client.py          # Dual-mode API client (Direct Web API vs. Slack CLI) & benchmark
 ├── test_connection.py     # 3-point diagnostic: token format, auth.test, WSS handshake
+├── APIClient/             # Modular Slack API Client package (Protocol & Factory)
+│   ├── __init__.py        # Package exports (APIClient, SlackWebClient, SlackCliClient, etc.)
+│   ├── protocol.py        # Protocol: APIClient (structural contract)
+│   ├── web_client.py      # Class: SlackWebClient (in-process persistent HTTPS)
+│   ├── cli_client.py      # Class: SlackCliClient (subprocess `slack api`)
+│   ├── provider.py        # Class: APIClientProvider (factory provider)
+│   ├── exceptions.py      # Class: SlackApiError (custom exception)
+│   └── benchmark.py       # Diagnostic & benchmark comparison runner
 ├── manifest.json          # Pre-configured Slack App Manifest (importable at api.slack.com)
 ├── requirements.txt       # Python dependencies (slack-bolt, slack-sdk, python-dotenv)
 ├── .env.example           # Safe template for credentials (never commit .env itself)

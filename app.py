@@ -50,7 +50,7 @@ Usage:
         $ python app.py
 
     See ``test_connection.py`` for a pre-flight diagnostic check, and
-    ``api_client.py`` for benchmarking ``SlackWebClient`` vs ``SlackCliClient``.
+    ``APIClient/benchmark.py`` for benchmarking ``SlackWebClient`` vs ``SlackCliClient``.
 """
 
 from __future__ import annotations
@@ -63,7 +63,7 @@ from dotenv import load_dotenv
 from slack_bolt import App
 from slack_bolt.adapter.socket_mode import SocketModeHandler
 
-from api_client import APIClient, APIClientProvider, SlackApiError
+from APIClient import APIClient, APIClientProvider, SlackApiError
 import processor
 
 # ---------------------------------------------------------------------------
