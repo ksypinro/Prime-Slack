@@ -22,8 +22,11 @@ An enterprise-ready, firewall-friendly Python application that observes Slack wo
 - [Step 3: Collect the App-Level Token (`xapp-...`)](#step-3-collect-the-app-level-token-xapp-)
 - [Step 4: Install the App & Collect Bot Token (`xoxb-...`)](#step-4-install-the-app--collect-bot-token-xoxb-)
 - [Step 5: Project Setup & Environment Configuration](#step-5-project-setup--environment-configuration)
-- [Step 6: Diagnostic Verification & Execution](#step-6-diagnostic-verification--execution)
 - [Deep Dive: Lifecycle, Code Flow & API Mechanics](#deep-dive-lifecycle-code-flow--api-mechanics)
+- [Sending API Requests: Direct Web API vs. Slack CLI](#sending-api-requests-direct-web-api-vs-slack-cli)
+  - [Under the Hood: HTTP Mechanics Comparison](#under-the-hood-http-mechanics-comparison)
+  - [Comprehensive Comparison Matrix](#comprehensive-comparison-matrix)
+  - [Dual-Mode Implementation (`api_client.py`)](#dual-mode-implementation-api_clientpy)
 - [Customizing the Analysis Logic (`processor.py`)](#customizing-the-analysis-logic-processorpy)
 - [Project Structure](#project-structure)
 
@@ -516,6 +519,148 @@ The [`processor.py`](processor.py) module is intentionally decoupled from all Sl
 
 ---
 
+## Sending API Requests: Direct Web API vs. Slack CLI
+
+This project supports and demonstrates **two distinct ways** of sending API requests to Slack:
+
+1. **Direct Slack Web API (In-Process HTTPS via Python SDK / REST)**
+2. **Slack CLI Subprocess (`slack api` command)**
+
+A dedicated dual-mode module, [`api_client.py`](api_client.py), implements both approaches and includes an automated benchmarking tool.
+
+---
+
+### Under the Hood: HTTP Mechanics Comparison
+
+#### Method 1: Direct Slack Web API (In-Process HTTPS)
+
+When you invoke a method via `client.chat_postMessage()` or `DirectWebClient.call()`:
+
+```
+[ Your Python App / WebClient ]
+           │
+           │  1. HTTP POST https://slack.com/api/chat.postMessage
+           │     Headers:
+           │       Authorization: Bearer xoxb-your-bot-token
+           │       Content-Type: application/json; charset=utf-8
+           │     Body:
+           │       {"channel": "C0123456", "text": "Hello, World!"}
+           ▼
+[ Slack Cloud Web API Gateway ]
+           │
+           │  2. HTTP 200 OK
+           │     Body:
+           │       {"ok": true, "channel": "C0123456", "ts": "1672531199.000100", ...}
+           ▼
+[ Your Python App (Parsed dict) ]
+```
+
+- **Mechanism:** Direct TCP/TLS socket connection opened from Python's process.
+- **Connection Reuse:** Uses HTTP Keep-Alive connection pooling (`urllib3` / `requests`), meaning subsequent calls reuse existing TLS connections.
+- **Latency:** ~300–400 ms per call.
+- **Error Handling:** Returns structured exceptions (`SlackApiError`) with HTTP status codes and error keys (e.g. `channel_not_found`, `ratelimited`).
+
+#### Method 2: Slack CLI Subprocess (`slack api <method>`)
+
+When you run `slack api` from the terminal or via `CliApiClient.call()`:
+
+```
+[ Your Shell or Python Subprocess ]
+           │
+           │  Executes: slack api chat.postMessage --json '{"channel":"C0123456","text":"Hello"}' --token xoxb-...
+           ▼
+[ Local Go Binary (~/.slack/bin/slack) ]
+           │
+           │  1. Resolves token from flag, env (SLACK_BOT_TOKEN), or keychain
+           │  2. Serializes flags/JSON body
+           │  3. Performs outbound HTTPS POST to https://slack.com/api/chat.postMessage
+           ▼
+[ Slack Cloud Web API Gateway ]
+           │
+           │  4. HTTP 200 OK
+           ▼
+[ Local Go Binary ]
+           │  5. Formats JSON and writes to stdout
+           ▼
+[ Terminal Output / Python stdout capture ]
+```
+
+- **Mechanism:** Spawns a new operating system process (`/usr/local/bin/slack` or `~/.slack/bin/slack`) for each command execution.
+- **Connection Overhead:** Every call performs a new process initialization, DNS lookup, TCP handshake, and TLS negotiation from scratch.
+- **Latency:** ~1,500–1,800 ms per call.
+- **Ergonomics:** Extremely convenient for bash scripts, shell piping (`slack api ... | jq`), and CI/CD pipelines without writing code.
+
+---
+
+### Comprehensive Comparison Matrix
+
+| Feature / Dimension | Method 1: Direct Web API (`slack_sdk`) | Method 2: Slack CLI (`slack api`) |
+| :--- | :--- | :--- |
+| **Execution Model** | In-Process (Python runtime) | Out-of-Process (Subprocess binary execution) |
+| **Transport** | Persistent HTTPS (HTTP Keep-Alive) | Ephemeral HTTPS (Per-command TCP/TLS handshake) |
+| **Observed Latency** | **~350 ms** *(~4.5x faster)* | **~1,650 ms** |
+| **Throughput / Scale** | High (handles hundreds of requests/sec) | Low (limited by OS process spawning) |
+| **System Dependencies** | Pure Python (`pip install slack-sdk`) | External Go binary installed on host machine |
+| **Authentication** | Explicit token (`token="xoxb-..."`) | Token flag, `SLACK_BOT_TOKEN` env, or `slack login` |
+| **Shell & CLI Piping** | Requires a Python runner script | Native: `slack api ... \| jq .user` |
+| **Retry & Rate Limiting**| Built-in SDK retry handlers & exponential backoff | Manual handling in shell / caller |
+| **Primary Use Cases** | Production bots, real-time Socket Mode listeners, microservices | Shell automation, GitHub Actions / CI, terminal diagnostics |
+
+---
+
+### Dual-Mode Implementation (`api_client.py`)
+
+The included [`api_client.py`](api_client.py) module provides clean Python classes for both approaches:
+
+```python
+from api_client import DirectWebClient, CliApiClient
+
+# 1. Direct Web API Client (In-process HTTPS)
+web_client = DirectWebClient()
+res_web = web_client.call("auth.test")
+print(res_web["user"])
+
+# 2. CLI-Based API Client (Subprocess execution)
+cli_client = CliApiClient()
+res_cli = cli_client.call("auth.test")
+print(res_cli["user"])
+```
+
+#### Run the Live Benchmark
+
+Run the comparison benchmark directly from your terminal:
+
+```bash
+python api_client.py
+```
+
+Sample output:
+```text
+======================================================================
+SLACK API COMPARISON BENCHMARK: method='auth.test'
+======================================================================
+
+[Method 1: Direct Slack Web API (Python SDK / In-Process HTTPS)]
+  Status   : SUCCESS (ok=True)
+  Latency  : 378.1 ms
+  Response : { "ok": true, "user": "this_is_my_assistant", ... }
+
+[Method 2: Slack CLI Subprocess (`slack api` command)]
+  Binary   : ~/.slack/bin/slack
+  Status   : SUCCESS (ok=True)
+  Latency  : 1656.9 ms
+  Response : { "ok": true, "user": "this_is_my_assistant", ... }
+
+----------------------------------------------------------------------
+COMPARISON SUMMARY:
+  Direct Web API :   378.1 ms (Persistent HTTPS session, zero process overhead)
+  Slack CLI      :  1656.9 ms (External Go binary spawn + handshake per call)
+  Performance    : Direct Web API is ~4.4x faster for real-time operations.
+======================================================================
+```
+
+---
+
 ## Customizing the Analysis Logic (`processor.py`)
 
 All task processing and context analysis is isolated inside [`processor.py`](processor.py). You can plug in any AI provider or internal automation script:
@@ -547,6 +692,7 @@ def process_thread_context(thread_messages, triggering_user, triggering_text):
 .
 ├── app.py                 # Core Bolt app — Socket Mode event listener & dispatcher
 ├── processor.py           # Pluggable thread context analyzer (LLM / automation hook)
+├── api_client.py          # Dual-mode API client (Direct Web API vs. Slack CLI) & benchmark
 ├── test_connection.py     # 3-point diagnostic: token format, auth.test, WSS handshake
 ├── manifest.json          # Pre-configured Slack App Manifest (importable at api.slack.com)
 ├── requirements.txt       # Python dependencies (slack-bolt, slack-sdk, python-dotenv)
