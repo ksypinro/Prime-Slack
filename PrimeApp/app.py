@@ -39,18 +39,12 @@ Lifecycle (per mention):
     6. Post the response back inside the thread via ``api_client.post_message``.
     7. Add a ✅ (:white_check_mark:) emoji reaction to signal completion via ``api_client.add_reaction``.
 
-Dependencies:
-    - ``slack-bolt``: Slack's official Python framework for event-driven apps.
-    - ``slack-sdk``: Low-level Slack Web API and Socket Mode client.
-    - ``python-dotenv``: Loads environment variables from a ``.env`` file.
-
 Usage:
     Ensure ``.env`` is configured with valid tokens, then run::
 
-        $ python app.py
-
-    See ``test_connection.py`` for a pre-flight diagnostic check, and
-    ``APIClient/benchmark.py`` for benchmarking ``SlackWebClient`` vs ``SlackCliClient``.
+        $ python -m PrimeApp.app
+        # or
+        $ python PrimeApp/app.py
 """
 
 from __future__ import annotations
@@ -58,17 +52,29 @@ from __future__ import annotations
 import os
 import sys
 import logging
+from pathlib import Path
+
+# Add project root to sys.path so APIClient and PrimeApp are resolvable
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
 from dotenv import load_dotenv
 from slack_bolt import App
 from slack_bolt.adapter.socket_mode import SocketModeHandler
 
 from APIClient import APIClient, APIClientProvider, SlackApiError
-import processor
+
+try:
+    from . import processor
+except ImportError:
+    import processor  # type: ignore[no-redef]
 
 # ---------------------------------------------------------------------------
 # 1. Configuration — Load environment variables from .env
 # ---------------------------------------------------------------------------
+# Check project root .env first, then current working directory
+load_dotenv(dotenv_path=PROJECT_ROOT / ".env")
 load_dotenv()
 
 SLACK_BOT_TOKEN: str | None = os.getenv("SLACK_BOT_TOKEN")
@@ -269,17 +275,20 @@ def handle_direct_messages(event: dict, client, logger) -> None:
 # 6. Entry Point — Start the Socket Mode listener
 # ---------------------------------------------------------------------------
 
-if __name__ == "__main__":
+def run_app() -> None:
+    """Start the Prime Bot Socket Mode service."""
     logger.info("=" * 60)
     logger.info("🚀 Starting Prime Bot in Socket Mode...")
     logger.info("   Connection: Outbound WebSocket (wss://) on port 443")
     logger.info("   Client:     %s (via APIClientProvider)", api_client.__class__.__name__)
     logger.info("   Tunnels:    None required (no ngrok / public webhooks)")
     logger.info("   Events:     app_mention, message.im")
-    logger.info("   Processor:  processor.py")
+    logger.info("   Package:    PrimeApp")
     logger.info("=" * 60)
 
-    # SocketModeHandler manages the WebSocket lifecycle: connection,
-    # reconnection on network drops, and graceful shutdown on SIGINT/SIGTERM.
     handler = SocketModeHandler(app, SLACK_APP_TOKEN)
     handler.start()
+
+
+if __name__ == "__main__":
+    run_app()

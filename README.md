@@ -389,7 +389,9 @@ The Bot Token is what gives your code the ability to act as the `@Prime` bot use
 Before launching the service, verify your credentials and network connection using the automated diagnostic tool:
 
 ```bash
-python test_connection.py
+python -m PrimeTest.test_connection
+# or
+python PrimeTest/test_connection.py
 ```
 
 The script performs a 3-point health check:
@@ -418,12 +420,15 @@ Expected output:
 
 ============================================================
 🎉 ALL TESTS PASSED! Your Slack setup is ready.
+👉 You can now run the bot with: python -m PrimeApp.app
 ============================================================
 ```
 
 ### 2. Start the Bot Service
 ```bash
-python app.py
+python -m PrimeApp.app
+# or
+python PrimeApp/app.py
 ```
 
 ### 3. Test in Slack
@@ -438,7 +443,7 @@ python app.py
 3. Watch the automated cycle happen live:
    - The bot adds a `👀` emoji reaction immediately.
    - It fetches the conversation history in the thread.
-   - It processes the text via [`processor.py`](processor.py).
+   - It processes the text via [`PrimeApp/processor.py`](PrimeApp/processor.py).
    - It posts the reply inside the thread.
    - It adds the `✅` emoji reaction upon completion.
 
@@ -507,7 +512,7 @@ After receiving the event, the code makes three separate REST API calls back to 
 ### 4. Processing Pipeline
 
 ```python
-# Thread context flows through processor.py:
+# Thread context flows through PrimeApp/processor.py:
 reply_content = processor.process_thread_context(
     thread_messages=thread_messages,    # Full thread history (list of dicts)
     triggering_user=user_id,            # Who asked
@@ -515,7 +520,7 @@ reply_content = processor.process_thread_context(
 )
 ```
 
-The [`processor.py`](processor.py) module is intentionally decoupled from all Slack logic — it receives plain Python data structures and returns a plain string. This makes it trivial to swap in an LLM, script executor, or any custom automation.
+The [`PrimeApp/processor.py`](PrimeApp/processor.py) module is intentionally decoupled from all Slack logic — it receives plain Python data structures and returns a plain string. This makes it trivial to swap in an LLM, script executor, or any custom automation.
 
 ---
 
@@ -671,13 +676,13 @@ client: APIClient = APIClientProvider.get_client()
 cli_client: APIClient = APIClientProvider.get_client("cli")
 ```
 
-#### 4. Switching Implementations in `app.py`
-The main application ([`app.py`](app.py)) holds an `APIClient` protocol reference obtained from `APIClientProvider`:
+#### 4. Switching Implementations in `PrimeApp/app.py`
+The main application ([`PrimeApp/app.py`](PrimeApp/app.py)) holds an `APIClient` protocol reference obtained from `APIClientProvider`:
 
 ```python
 from APIClient import APIClient, APIClientProvider
 
-# app.py holds the APIClient protocol:
+# PrimeApp holds the APIClient protocol:
 api_client: APIClient = APIClientProvider.get_client()
 
 # Handlers use the protocol methods interchangeably:
@@ -729,9 +734,9 @@ COMPARISON SUMMARY:
 
 ---
 
-## Customizing the Analysis Logic (`processor.py`)
+## Customizing the Analysis Logic (`PrimeApp/processor.py`)
 
-All task processing and context analysis is isolated inside [`processor.py`](processor.py). You can plug in any AI provider or internal automation script:
+All task processing and context analysis is isolated inside [`PrimeApp/processor.py`](PrimeApp/processor.py). You can plug in any AI provider or internal automation script:
 
 ### Example: Connecting OpenAI / Anthropic / Gemini
 ```python
@@ -758,9 +763,13 @@ def process_thread_context(thread_messages, triggering_user, triggering_text):
 
 ```
 .
-├── app.py                 # Core Bolt app — Socket Mode event listener & dispatcher
-├── processor.py           # Pluggable thread context analyzer (LLM / automation hook)
-├── test_connection.py     # 3-point diagnostic: token format, auth.test, WSS handshake
+├── PrimeApp/              # Core application & processing package
+│   ├── __init__.py        # Package exports (app, api_client, run_app, etc.)
+│   ├── app.py             # Core Bolt app — Socket Mode event listener & dispatcher
+│   └── processor.py       # Pluggable thread context analyzer (LLM / automation hook)
+├── PrimeTest/             # Diagnostic & pre-flight verification package
+│   ├── __init__.py        # Package exports (run_diagnostics)
+│   └── test_connection.py # 3-point diagnostic: token format, auth.test, WSS handshake
 ├── APIClient/             # Modular Slack API Client package (Protocol & Factory)
 │   ├── __init__.py        # Package exports (APIClient, SlackWebClient, SlackCliClient, etc.)
 │   ├── protocol.py        # Protocol: APIClient (structural contract)

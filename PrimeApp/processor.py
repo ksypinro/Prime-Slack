@@ -36,24 +36,25 @@ Integration Example (OpenAI):
         return response.choices[0].message.content
 """
 
+from __future__ import annotations
+
 import re
 import logging
 from typing import List, Dict, Any
 
-logger = logging.getLogger(__name__)
+logger: logging.Logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
 
 # Regex pattern to match Slack user mention tags like <@U012AB3CD4E>
-_MENTION_TAG_PATTERN = re.compile(r"<@[A-Z0-9]+>")
+_MENTION_TAG_PATTERN: re.Pattern = re.compile(r"<@[A-Z0-9]+>")
 
 
 # ---------------------------------------------------------------------------
 # Helper Functions
 # ---------------------------------------------------------------------------
-
 
 def extract_thread_summary(messages: List[Dict[str, Any]]) -> str:
     """Format raw Slack thread messages into a human-readable transcript.
@@ -112,7 +113,6 @@ def _clean_mention_tags(text: str) -> str:
 # ---------------------------------------------------------------------------
 # Core Processing Function
 # ---------------------------------------------------------------------------
-
 
 def process_thread_context(
     thread_messages: List[Dict[str, Any]],

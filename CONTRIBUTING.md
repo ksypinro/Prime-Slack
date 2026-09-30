@@ -40,11 +40,15 @@ By participating in this project, you agree to abide by our [Code of Conduct](CO
 4. **Test your changes:**
    - Run syntax verification:
      ```bash
-     python3 -m py_compile app.py processor.py test_connection.py
+     python3 -m py_compile PrimeApp/*.py PrimeTest/*.py APIClient/*.py
      ```
    - Verify connection test:
      ```bash
-     python test_connection.py
+     python -m PrimeTest.test_connection
+     ```
+   - Run APIClient benchmark:
+     ```bash
+     python -m APIClient.benchmark
      ```
 5. **Commit your changes:**
    - Use clear commit messages following Conventional Commits (e.g., `feat: ...`, `fix: ...`, `docs: ...`).
@@ -57,4 +61,6 @@ By participating in this project, you agree to abide by our [Code of Conduct](CO
 ## Development Guidelines
 
 - **Zero Webhook Ingress:** Keep the design focused on Socket Mode and firewall-friendly WebSocket streaming. Do not introduce requirements for open ports or public HTTP endpoints.
-- **Modularity:** Keep LLM / reasoning integrations encapsulated inside [`processor.py`](processor.py) to ensure the core listener remains lightweight and extensible.
+- **Modularity:** Keep LLM / reasoning integrations encapsulated inside [`PrimeApp/processor.py`](PrimeApp/processor.py) to ensure the core listener remains lightweight and extensible.
+- **Protocol & Factory Pattern:** Outbound API calls should strictly utilize [`APIClient`](APIClient/protocol.py) via [`APIClientProvider`](APIClient/provider.py).
+
