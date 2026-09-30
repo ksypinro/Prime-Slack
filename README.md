@@ -344,8 +344,8 @@ The Bot Token is what gives your code the ability to act as the `@Prime` bot use
 
 1. **Clone this repository:**
    ```bash
-   git clone <your-repository-url>
-   cd "Slack CLI"
+   git clone https://github.com/ksypinro/Prime-Slack.git
+   cd Prime-Slack
    ```
 
 2. **Create and activate a Python virtual environment:**
