@@ -356,17 +356,26 @@ def process_thread_context(thread_messages, triggering_user, triggering_text):
 
 ```
 .
-├── app.py                 # Core Bolt app & Socket Mode event router
-├── processor.py           # Thread context parsing and AI/automation logic
-├── test_connection.py     # Diagnostic tool for tokens and WebSocket connection
-├── manifest.json          # Pre-configured Slack App Manifest (importable)
+├── app.py                 # Core Bolt app — Socket Mode event listener & dispatcher
+├── processor.py           # Pluggable thread context analyzer (LLM / automation hook)
+├── test_connection.py     # 3-point diagnostic: token format, auth.test, WSS handshake
+├── manifest.json          # Pre-configured Slack App Manifest (importable at api.slack.com)
 ├── requirements.txt       # Python dependencies (slack-bolt, slack-sdk, python-dotenv)
-├── .env.example           # Safe template for credentials
-├── .gitignore             # Safeguards secrets, cache, and virtual environments
-└── README.md              # Detailed documentation
+├── .env.example           # Safe template for credentials (never commit .env itself)
+├── .gitignore             # Safeguards secrets, venv, cache, and editor metadata
+├── LICENSE                # MIT License
+├── CONTRIBUTING.md        # Contributor guidelines and PR workflow
+├── CODE_OF_CONDUCT.md     # Contributor Covenant v2.1
+├── SECURITY.md            # Vulnerability disclosure policy & token security practices
+└── README.md              # This file — setup, architecture, and usage documentation
 ```
 
 ---
 
+## Contributing
+
+Contributions are welcome! Please read [CONTRIBUTING.md](CONTRIBUTING.md) before submitting a pull request.
+
 ## License
-MIT License. Feel free to use and adapt this project for personal or enterprise Slack workflows.
+
+This project is licensed under the [MIT License](LICENSE). Feel free to use and adapt it for personal or enterprise Slack workflows.
